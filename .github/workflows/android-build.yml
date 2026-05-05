@@ -1,0 +1,143 @@
+name: Android Build
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build APK / AAB
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── JDK ───────────────────────────────────────────────────────────────
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # ── Locate Gradle project ─────────────────────────────────────────────
+      - name: Detect Gradle project root
+        id: gradle-root
+        run: |
+          chmod +x scripts/ci/find-gradle-root.sh
+          GRADLE_ROOT=$(scripts/ci/find-gradle-root.sh "$GITHUB_WORKSPACE")
+          echo "Gradle project root: $GRADLE_ROOT"
+          echo "path=$GRADLE_ROOT" >> "$GITHUB_OUTPUT"
+
+      # ── Gradle cache ──────────────────────────────────────────────────────
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties', '**/libs.versions.toml') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      # ── Make gradlew executable ───────────────────────────────────────────
+      - name: Make gradlew executable
+        working-directory: ${{ steps.gradle-root.outputs.path }}
+        run: chmod +x gradlew
+
+      # ── Optional: write signing config from secrets ───────────────────────
+      - name: Configure release signing (if secrets are present)
+        id: signing
+        working-directory: ${{ steps.gradle-root.outputs.path }}
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ] && \
+             [ -n "$KEYSTORE_PASSWORD" ] && \
+             [ -n "$KEY_ALIAS" ] && \
+             [ -n "$KEY_PASSWORD" ]; then
+            echo "Signing secrets detected — configuring release signing."
+            KEYSTORE_PATH="$(mktemp --suffix=.jks)"
+            chmod 600 "$KEYSTORE_PATH"
+            echo "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
+            {
+              echo "signing.storeFile=$KEYSTORE_PATH"
+              echo "signing.storePassword=$KEYSTORE_PASSWORD"
+              echo "signing.keyAlias=$KEY_ALIAS"
+              echo "signing.keyPassword=$KEY_PASSWORD"
+            } >> local.properties
+            echo "available=true"  >> "$GITHUB_OUTPUT"
+            echo "keystore=$KEYSTORE_PATH" >> "$GITHUB_OUTPUT"
+          else
+            echo "One or more signing secrets are missing — release signing will be skipped."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Debug build (always) ──────────────────────────────────────────────
+      - name: Build Debug APK
+        working-directory: ${{ steps.gradle-root.outputs.path }}
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      # ── Release build (optional) ──────────────────────────────────────────
+      - name: Build Release AAB
+        if: steps.signing.outputs.available == 'true'
+        working-directory: ${{ steps.gradle-root.outputs.path }}
+        run: ./gradlew bundleRelease --no-daemon --stacktrace
+
+      - name: Build Release APK (unsigned fallback)
+        if: steps.signing.outputs.available != 'true'
+        working-directory: ${{ steps.gradle-root.outputs.path }}
+        run: |
+          echo "Skipping signed release — building unsigned release APK for reference only."
+          ./gradlew assembleRelease --no-daemon --stacktrace || \
+            echo "::warning::Unsigned release build failed or was skipped."
+
+      # ── Upload Debug APK ──────────────────────────────────────────────────
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-apk
+          path: |
+            **/build/outputs/apk/debug/**/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      # ── Upload Release AAB (when signed) ──────────────────────────────────
+      - name: Upload Release AAB
+        if: steps.signing.outputs.available == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-aab
+          path: |
+            **/build/outputs/bundle/release/**/*.aab
+          if-no-files-found: warn
+          retention-days: 14
+
+      # ── Upload Release APK (unsigned fallback) ────────────────────────────
+      - name: Upload Release APK (unsigned)
+        if: steps.signing.outputs.available != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-apk-unsigned
+          path: |
+            **/build/outputs/apk/release/**/*.apk
+          if-no-files-found: warn
+          retention-days: 14
+
+      # ── Clean up keystore from temp location ──────────────────────────────
+      - name: Remove keystore
+        if: always() && steps.signing.outputs.keystore != ''
+        run: |
+          rm -f "${{ steps.signing.outputs.keystore }}"
+          # Remove signing entries written to local.properties so they are
+          # not present in any post-job artifact upload or cache
+          if [ -f "${{ steps.gradle-root.outputs.path }}/local.properties" ]; then
+            sed -i '/^signing\./d' "${{ steps.gradle-root.outputs.path }}/local.properties"
+          fi
